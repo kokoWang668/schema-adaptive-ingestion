@@ -124,6 +124,22 @@ all-blank columns. That ordering is not a shortcut around the model — it is th
 same judgement the model is asked to make, and it is why the drift fixture
 recovers correctly.
 
+**Why have a model at all, if the regexes get every fixture right?** Because five
+fields whose value shapes barely overlap is the easy case, and it is the case
+these fixtures are built around so that the repo runs without a key. Real
+manifests are longer and their shapes collide: two date columns (departure and
+booking), a passenger name beside an agency name, a price beside a headcount, an
+ID beside a phone number. Shape narrows the candidates; it does not pick between
+them — which is how the alias table above fails, one level down. A rule that
+cannot separate two plausible readings will still choose one, silently.
+
+The division of labour follows from that. Shape checks are cheap, so they run on
+every file — they are what the sampling in step 4 is made of. Inference is
+expensive, so it runs once per layout, and it is what gets called when shape is
+not enough. The offline provider implements the cheap half and stops there;
+`AnthropicProvider` is the other half. The routing in `ingest.ts` cannot tell
+which one it is holding, which is the property that matters.
+
 Fixtures are CSV so they are readable on GitHub. Production reads `.xlsx` through
 SheetJS; everything below the reader sees the same `{ headers, rows }`.
 
