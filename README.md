@@ -1,16 +1,21 @@
-# schema-adaptive-ingestion
+# Schema-Adaptive Spreadsheet Ingestion
 
-Ingesting customer spreadsheets whose column layouts all differ, without calling
-an LLM on every file.
+Every customer sends the same data in a different spreadsheet. This is a small
+reference implementation of the pattern I use in production to ingest them
+without calling an LLM on every file.
 
-This is a stripped-down version of a pattern I run in production, with toy data.
+**Core idea:** the LLM runs on the cold path, deterministic code runs on the hot
+path. A new layout costs one model call; every file after that costs zero.
+
 It is one idea, not a library: `src/ingest.ts` is 50 lines and everything else
 exists to keep it that short.
 
+---
+
 ## The problem
 
-Three tour operators send passenger manifests. Same five facts, three layouts,
-and none of them will change their export for me:
+I run a tour-operator scheduling product. Each operator exports their passenger
+manifest from a different system, so no two files agree on anything:
 
 | What I need     | Operator A (FR) | Operator B (EN) | Operator C |
 | --------------- | --------------- | --------------- | ---------- |
@@ -23,23 +28,26 @@ and none of them will change their export for me:
 Column order varies between exports from the same operator, and a layout changes
 without warning when someone edits the template.
 
-## Why the three obvious options don't work
+## Why the obvious options don't work
 
-**A parser per customer.** Correct on day one. It is also a code change every
-time an operator is onboarded or edits their template, which means ingestion is
-blocked on a deploy. This scales with headcount, not with customers.
+**Ask customers to use my template.** They won't. The export comes out of
+software they don't control.
 
-**An alias table — `tél`, `tel`, `phone`, `contact` → `phone`.** Fine until two
-readings are both common. `Contact` is a phone number for one operator and an
+**Hand-write a parser per customer.** Correct on day one. It is also a code
+change every time an operator is onboarded or edits their template, which means
+ingestion is blocked on a deploy. This scales with headcount, not with customers.
+
+**Keep an alias table — `tél`, `tel`, `phone`, `contact` → `phone`.** Fine until
+two readings are both common. `Contact` is a phone number for one operator and an
 email address for another; `Pax` is a passenger name in one file and a headcount
 in the next. The alias table cannot see the values, so it guesses, and it guesses
 silently. The failure looks like clean data.
 
-**Send every file to a model.** It works, and it is the version I keep meeting.
-The cost and latency are per file rather than per layout, even though the answer
-is identical for the ten thousand files sharing one layout. It also makes every
-ingest non-deterministic and dependent on an external service being up — a bad
-property for a step that runs before anything else in the pipeline.
+**Send every file to an LLM.** Works, but you pay per file forever, latency is
+unpredictable, and the same file can parse differently on two different runs. The
+answer is identical for the ten thousand files sharing one layout, and it also
+makes ingestion — the step that runs before everything else — depend on an
+external service being up.
 
 The layouts are few. The files are many. The mapping only needs to be computed
 per layout.
@@ -47,36 +55,65 @@ per layout.
 ## The approach
 
 ```
-fingerprint(headers)
-  │
-  ├── cache hit  → validate a sample of rows
-  │                 ├── pass → deterministic parse        (0 model calls)
-  │                 └── fail → re-infer, overwrite cache   (1 model call)
-  │
-  └── cache miss → infer mapping, write to cache           (1 model call)
+        upload
+          │
+          ▼
+   ┌──────────────┐
+   │  fingerprint │  normalised header set, sorted, hashed
+   └──────┬───────┘
+          │
+     ┌────┴────┐
+   hit        miss
+     │           │
+     ▼           ▼
+┌─────────┐  ┌───────────────┐
+│ cached  │  │  LLM infers   │
+│ mapping │  │ column → field│
+└────┬────┘  └──────┬────────┘
+     │              │
+     ▼              │
+┌──────────────┐    │
+│ sample check │    │
+│  (N rows)    │    │
+└────┬────┬────┘    │
+   pass  fail       │
+     │    └─────────┤
+     ▼              ▼
+   parse      write mapping
+                to cache
 ```
 
-Four things make it work:
+Two paths, one loop:
 
-**The fingerprint identifies a layout, not a file.** Headers are normalised
-(lowercase, accents stripped via NFD, punctuation and whitespace removed), then
-**sorted**, then hashed. Sorting is what makes a reordered export a cache hit
-rather than a new layout. `Tél.` and `TEL` land on the same key.
+1. **Fingerprint the layout.** Normalise the header row (lowercase, accents
+   stripped via NFD, punctuation and whitespace removed), **sort** it, hash it.
+   Sorting is what makes a reordered export a cache hit rather than a new layout.
+   `Tél.` and `TEL` land on the same key.
+2. **Cache hit → deterministic parse.** No model call, no variance, single-digit
+   milliseconds.
+3. **Cache miss → LLM maps columns to canonical fields.** The mapping is stored
+   against the fingerprint, so this cost is paid once per layout, not once per
+   file.
+4. **Validate by sampling.** After a cache hit, check a few rows against the
+   expected shape for each mapped field. If validation fails, fall back to the
+   LLM path and **overwrite** the stored mapping.
+
+Step 4 is what makes the system self-healing. When a customer's export tool
+changes what sits under a header, the pipeline notices, re-learns the layout
+once, and goes back to the fast path — no ticket, no manual fix.
+
+Two details that are easy to get wrong:
 
 **The mapping is keyed by normalised header, never by column index.** If it were
 keyed by index, a customer inserting a column would shift every field by one and
 the parse would still "succeed".
-
-**Re-inference overwrites.** After drift, the stale mapping is exactly the thing
-that just failed, so it is replaced rather than merged. One model call, then the
-layout is back on the hot path.
 
 **Nothing reaches the parser without passing the canonical allow-list.** Models
 return `customer_name`, or `notes`, or a header the file does not have.
 `sanitiseMapping` drops all of it. An unmapped field is a visible hole; an
 invented one is a silent wrong answer.
 
-The cold path is behind a one-method interface with two implementations: an
+The cold path sits behind a one-method interface with two implementations: an
 offline one (no key, no network — this is what `npm test` and `npm run demo` use)
 and an Anthropic one. Which provider is installed does not change which branch a
 file takes.
@@ -84,7 +121,8 @@ file takes.
 The offline provider infers from **value shape first** (email regex, digit count,
 date parse, small integer) and falls back to header keywords only for ties and
 all-blank columns. That ordering is not a shortcut around the model — it is the
-same judgement the model is asked to make, and it is why fixture #4 recovers.
+same judgement the model is asked to make, and it is why the drift fixture
+recovers correctly.
 
 Fixtures are CSV so they are readable on GitHub. Production reads `.xlsx` through
 SheetJS; everything below the reader sees the same `{ headers, rows }`.
@@ -94,20 +132,30 @@ SheetJS; everything below the reader sees the same `{ headers, rows }`.
 The interesting part. This design trades one class of failure for another
 deliberately, and one hole is still open.
 
-**Unsolved: same headers, same value types, different meaning.** An operator
-starts putting the *booking* date under `Travel Date` instead of the departure
-date. The header set is unchanged, so the fingerprint matches; every sampled
-value is still a valid date, so sampling passes. The file is served from cache
-and booking dates arrive labelled `departureDate`. Nothing in this design can see
-it.
+**Same headers, different meaning.** ⚠️ Not solved. An operator starts putting
+the *booking* date under `Travel Date` instead of the departure date. The header
+set is unchanged, so the fingerprint matches; every sampled value is still a
+valid date, so sampling passes. The file is served from cache and booking dates
+arrive labelled `departureDate`. The pipeline is confidently wrong.
 
-There is an executing test for this — `KNOWN BLIND SPOT` in `src/ingest.test.ts`
-— that asserts the current, wrong behaviour. Closing it needs value
-*distribution* checks rather than value *shape* checks (departure dates cluster
-in the future, booking dates in the past), recorded at inference time and
-compared on later files. That is a different mechanism with its own
-false-positive budget, so I have not built it. The test is there so the gap stays
-visible instead of becoming folklore.
+Catching this needs value-*distribution* checks rather than value-*shape* checks
+(departure dates cluster in the future, booking dates in the past), recorded at
+inference time and compared on later files. That is a different mechanism with
+its own false-positive budget, and I haven't built it. There is an executing test
+for the gap — `KNOWN BLIND SPOT` in `src/ingest.test.ts` — that asserts the
+current, wrong behaviour. I'd rather document the blind spot in a test that runs
+than pretend the sampling covers it.
+
+**Cosmetic header drift.** `Phone` → `Phone Number` changes the fingerprint and
+forces an unnecessary re-inference. Normalisation absorbs case, accents,
+whitespace and punctuation, but not synonyms. Acceptable: it costs one model
+call, and the new fingerprint is cached immediately.
+
+**Column reordering.** Handled by sorting the header set before hashing, so a
+reordered file still hits the cache. There's a test for it.
+
+**Added or removed columns.** Changes the fingerprint, so it re-infers rather
+than silently mis-parsing. This is the safe failure.
 
 **Cache thrash between two files that share a fingerprint.** Fixtures #3 and #4
 have identical headers and disagree about contents. Alternating between them
@@ -133,24 +181,22 @@ booking-date case does.
 key. The mapping holds one entry and the second column is dropped. Rare, and I
 would rather have the collision than have accents produce two layouts.
 
-**Adding, removing or renaming a column always costs one model call.** That is
-the intended failure, not a regression: a changed header set means a column I
-have never reasoned about, and re-inferring once is cheaper than mis-parsing
-silently.
-
 ## Results
 
-<!-- TODO(me): fill from production logs, or delete this section before sending. The values below are placeholders, not measurements. -->
+<!-- TODO(me): replace with logged production numbers, or delete this section before sending. Everything below is a placeholder, not a measurement. -->
 
-| Metric                   | Value |
-| ------------------------ | ----- |
-| Files ingested           | TBD   |
-| Distinct layouts         | TBD   |
-| Model calls / 1000 files | TBD   |
-| Median hot-path latency  | TBD   |
-| Re-inferences from drift | TBD   |
+Measured over `<PERIOD>` of production traffic, `<N>` files from `<M>` operators:
 
-The demo, on the five fixtures in this repo: **4 model calls for 5 files** — one
+| Path                         | Share | Model calls |
+| ---------------------------- | ----- | ----------- |
+| Cache hit, validation passed  | `<X>%` | 0           |
+| New layout, first ingest      | `<Y>%` | 1           |
+| Drift detected, auto re-learned | `<Z>%` | 1         |
+
+Field-level accuracy on the cold path, measured against `<N>` hand-labelled
+files: `<A>%`. Remaining errors fall into `<describe the categories>`.
+
+The demo in this repo, on its five fixtures: **4 model calls for 5 files** — one
 per distinct layout, plus one drift recovery.
 
 ## Repo layout
@@ -165,19 +211,22 @@ src/
   csv.ts           fixture reader -> { headers, rows }
   ingest.ts        the routing — the file worth reading
   demo.ts          runs every fixture, prints path + model calls per file
-fixtures/          5 synthetic CSVs (no real customer data)
+fixtures/          5 synthetic CSVs
 ```
 
-## Running it
+## Running the example
 
 ```bash
 npm install
 npm test
 ```
 
-`npm test` is 14 tests and needs no API key and no network. `npm run demo` prints
-the path each fixture takes; `npm run typecheck` runs `tsc --noEmit` under strict
-mode with `noUncheckedIndexedAccess`.
+`npm test` is 14 tests and needs no API key and no network — it covers
+normalisation, fingerprint stability under reordering, fingerprint change on
+add/rename, zero provider calls on a known layout, drift detection and recovery,
+and the blind spot above. `npm run demo` ingests every fixture and prints the
+path each one took; `npm run typecheck` runs `tsc --noEmit` under strict mode
+with `noUncheckedIndexedAccess`.
 
 Demo output:
 
@@ -193,19 +242,23 @@ file                        fingerprint       path   model calls
 Only `AnthropicProvider` needs `ANTHROPIC_API_KEY`, and nothing in the test or
 demo path constructs it.
 
+`fixtures/` contains synthetic spreadsheets in several layouts. No customer data
+appears anywhere in this repository — the production system handles personal
+information under Quebec's Law 25, and every example here is generated.
+
 ## What I'd build next
 
-1. **Value-distribution checks**, to close the blind spot above. Record a cheap
-   per-field profile at inference time (date range relative to ingest time, digit
-   length histogram, null rate) and compare it on later files. Needs a
-   false-positive budget before it goes anywhere near a hot path.
-2. **Per-layout metrics** — re-inference rate, sample-failure rate by field. A
-   fingerprint that re-infers often is one fingerprint covering two layouts, and
-   right now I would only find that by reading logs.
-3. **A confidence signal on the cold path**, so a mapping the model was unsure
-   about lands in a review queue instead of straight into the cache. Today a
-   confidently wrong mapping and a confidently right one are indistinguishable
-   until sampling catches the difference.
-4. **Store the sample a mapping was inferred from.** When a mapping turns out to
-   be wrong, the first question is always "what did it look at", and right now
-   that is unanswerable.
+1. **Value-distribution validation**, to close the "same headers, different
+   meaning" gap above. A cheap per-field profile recorded at inference time (date
+   range relative to ingest time, digit-length histogram, null rate), compared on
+   later files. Needs a false-positive budget before it goes near a hot path.
+2. **Fuzzy fingerprint matching**, so a cosmetic rename reuses the existing
+   mapping instead of re-inferring — with the re-inference kept as the fallback
+   when the fuzzy match is not confident.
+3. **A confidence score on the cold path**, routing low-confidence mappings to a
+   human review queue rather than straight into the parser. Today a confidently
+   wrong mapping and a confidently right one are indistinguishable until sampling
+   catches the difference.
+4. **Per-layout metrics** — re-inference rate, sample-failure rate by field. A
+   fingerprint that re-infers often is one fingerprint covering two real layouts,
+   and right now I would only find that by reading logs.
