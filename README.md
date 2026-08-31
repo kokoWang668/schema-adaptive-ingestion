@@ -181,24 +181,6 @@ booking-date case does.
 key. The mapping holds one entry and the second column is dropped. Rare, and I
 would rather have the collision than have accents produce two layouts.
 
-## Results
-
-<!-- TODO(me): replace with logged production numbers, or delete this section before sending. Everything below is a placeholder, not a measurement. -->
-
-Measured over `<PERIOD>` of production traffic, `<N>` files from `<M>` operators:
-
-| Path                         | Share | Model calls |
-| ---------------------------- | ----- | ----------- |
-| Cache hit, validation passed  | `<X>%` | 0           |
-| New layout, first ingest      | `<Y>%` | 1           |
-| Drift detected, auto re-learned | `<Z>%` | 1         |
-
-Field-level accuracy on the cold path, measured against `<N>` hand-labelled
-files: `<A>%`. Remaining errors fall into `<describe the categories>`.
-
-The demo in this repo, on its five fixtures: **4 model calls for 5 files** — one
-per distinct layout, plus one drift recovery.
-
 ## Repo layout
 
 ```
@@ -238,6 +220,8 @@ file                        fingerprint       path   model calls
 04-en-contents-swapped.csv  6cce635261e3b34c  DRIFT  1
 05-abbrev-uppercase.csv     061c0095a1920438  COLD   1
 ```
+
+Five files, three distinct layouts, one drift recovery: **4 model calls**.
 
 Only `AnthropicProvider` needs `ANTHROPIC_API_KEY`, and nothing in the test or
 demo path constructs it.
