@@ -197,6 +197,31 @@ booking-date case does.
 key. The mapping holds one entry and the second column is dropped. Rare, and I
 would rather have the collision than have accents produce two layouts.
 
+## Results
+
+Three months of production use, from the system this repo is a cut-down version
+of:
+
+| Month  | Trips created | New layouts learned |
+| ------ | ------------- | ------------------- |
+| May    | 1             | 2                   |
+| June   | 6             | 6                   |
+| July   | 36            | 2                   |
+| August | 58            | 0                   |
+
+Monthly volume grew roughly tenfold between June and August while new layouts
+went to zero. The layout set saturates: inference cost is bounded by how many
+ways customers format a spreadsheet, not by how many spreadsheets they send.
+That is the property the whole design rests on, and it is why the per-file
+variant is the wrong shape rather than merely the expensive one.
+
+What these numbers are not. Trips are an upper bound on files ingested, not a
+count of them — not every trip starts from an import, and the success path is
+not instrumented. A month with no new layout is also not a month with no model
+calls: a file can fail sampling, get re-inferred, and produce a mapping identical
+to the one already stored. These are the numbers I have, not the ones I would
+want, and a counter on the hot path is the first thing I would add.
+
 ## Repo layout
 
 ```
